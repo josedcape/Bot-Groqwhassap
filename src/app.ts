@@ -1,115 +1,182 @@
-import { join } from 'path'
-import { createBot, createProvider, createFlow, addKeyword, utils } from '@builderbot/bot'
-import { MemoryDB as Database } from '@builderbot/bot'
-import { BaileysProvider as Provider } from '@builderbot/provider-baileys'
+import dotenv from 'dotenv';
+// Cargar variables de entorno desde .env
+dotenv.config();
 
-const PORT = process.env.PORT ?? 3008
+import { createBot, createProvider, createFlow, addKeyword, utils } from '@builderbot/bot';
+import { MemoryDB } from '@builderbot/bot';
+import { BaileysProvider } from '@builderbot/provider-baileys';
+import { generateGroqResponse } from '../base-ts-baileys-memory/src/services/groq';
+import { TextToSpeechClient, protos as ttsProtos } from '@google-cloud/text-to-speech'; // Importar 'protos'
+import fs from 'fs';
+import axios from 'axios';
+import { v4 as uuidv4 } from 'uuid';
+import { typing } from "../base-ts-baileys-memory/src/utils/presence";
+import { transcribeWithWhisper } from '../base-ts-baileys-memory/src/services/whisper'; // Asegúrate de que esta ruta sea correcta
+import { sendTextAndImage } from "../base-ts-baileys-memory/src/utils/imageTextService"; // Importar la nueva función correctamente
 
-const discordFlow = addKeyword<Provider, Database>('doc').addAnswer(
-    ['You can see the documentation here', '📄 https://builderbot.app/docs \n', 'Do you want to continue? *yes*'].join(
-        '\n'
-    ),
-    { capture: true },
-    async (ctx, { gotoFlow, flowDynamic }) => {
-        if (ctx.body.toLocaleLowerCase().includes('yes')) {
-            return gotoFlow(registerFlow)
-        }
-        await flowDynamic('Thanks!')
-        return
-    }
-)
+// Inicializar cliente de Text-to-Speech
+const ttsClient = new TextToSpeechClient();
 
-const welcomeFlow = addKeyword<Provider, Database>(['hi', 'hello', 'hola'])
-    .addAnswer(`🙌 Hello welcome to this *Chatbot*`)
-    .addAnswer(
-        [
-            'I share with you the following links of interest about the project',
-            '👉 *doc* to view the documentation',
-        ].join('\n'),
-        { delay: 800, capture: true },
-        async (ctx, { fallBack }) => {
-            if (!ctx.body.toLocaleLowerCase().includes('doc')) {
-                return fallBack('You should type *doc*')
-            }
-            return
-        },
-        [discordFlow]
-    )
-
-const registerFlow = addKeyword<Provider, Database>(utils.setEvent('REGISTER_FLOW'))
-    .addAnswer(`What is your name?`, { capture: true }, async (ctx, { state }) => {
-        await state.update({ name: ctx.body })
-    })
-    .addAnswer('What is your age?', { capture: true }, async (ctx, { state }) => {
-        await state.update({ age: ctx.body })
-    })
-    .addAction(async (_, { flowDynamic, state }) => {
-        await flowDynamic(`${state.get('name')}, thanks for your information!: Your age: ${state.get('age')}`)
-    })
-
-const fullSamplesFlow = addKeyword<Provider, Database>(['samples', utils.setEvent('SAMPLES')])
-    .addAnswer(`💪 I'll send you a lot files...`)
-    .addAnswer(`Send image from Local`, { media: join(process.cwd(), 'assets', 'sample.png') })
-    .addAnswer(`Send video from URL`, {
-        media: 'https://media.giphy.com/media/v1.Y2lkPTc5MGI3NjExYTJ0ZGdjd2syeXAwMjQ4aWdkcW04OWlqcXI3Ynh1ODkwZ25zZWZ1dCZlcD12MV9pbnRlcm5hbF9naWZfYnlfaWQmY3Q9Zw/LCohAb657pSdHv0Q5h/giphy.mp4',
-    })
-    .addAnswer(`Send audio from URL`, { media: 'https://cdn.freesound.org/previews/728/728142_11861866-lq.mp3' })
-    .addAnswer(`Send file from URL`, {
-        media: 'https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf',
-    })
-
-const main = async () => {
-    const adapterFlow = createFlow([welcomeFlow, registerFlow, fullSamplesFlow])
-    
-    const adapterProvider = createProvider(Provider)
-    const adapterDB = new Database()
-
-    const { handleCtx, httpServer } = await createBot({
-        flow: adapterFlow,
-        provider: adapterProvider,
-        database: adapterDB,
-    })
-
-    adapterProvider.server.post(
-        '/v1/messages',
-        handleCtx(async (bot, req, res) => {
-            const { number, message, urlMedia } = req.body
-            await bot.sendMessage(number, message, { media: urlMedia ?? null })
-            return res.end('sended')
-        })
-    )
-
-    adapterProvider.server.post(
-        '/v1/register',
-        handleCtx(async (bot, req, res) => {
-            const { number, name } = req.body
-            await bot.dispatch('REGISTER_FLOW', { from: number, name })
-            return res.end('trigger')
-        })
-    )
-
-    adapterProvider.server.post(
-        '/v1/samples',
-        handleCtx(async (bot, req, res) => {
-            const { number, name } = req.body
-            await bot.dispatch('SAMPLES', { from: number, name })
-            return res.end('trigger')
-        })
-    )
-
-    adapterProvider.server.post(
-        '/v1/blacklist',
-        handleCtx(async (bot, req, res) => {
-            const { number, intent } = req.body
-            if (intent === 'remove') bot.blacklist.remove(number)
-            if (intent === 'add') bot.blacklist.add(number)
-
-            res.writeHead(200, { 'Content-Type': 'application/json' })
-            return res.end(JSON.stringify({ status: 'ok', number, intent }))
-        })
-    )
-
-    httpServer(+PORT)
+// Verificar que las variables de entorno estén bien definidas
+if (!process.env.GROQ_API_KEY) {
+    throw new Error('La variable de entorno GROQ_API_KEY no está definida.');
 }
 
-main()
+if (!process.env.GOOGLE_APPLICATION_CREDENTIALS) {
+    throw new Error('La variable de entorno GOOGLE_APPLICATION_CREDENTIALS no está definida.');
+}
+
+const PORT = parseInt(process.env.PORT || '3008', 10); // Puerto de la aplicación
+
+/** Crear el directorio de audios si no existe */
+function ensureAudiosDirectory() {
+    const audiosDir = './audios/';
+    const receivedDir = `${audiosDir}received/`;
+    const sentDir = `${audiosDir}sent/`;
+
+    if (!fs.existsSync(audiosDir)) {
+        fs.mkdirSync(audiosDir, { recursive: true });
+        console.log(`Directorio '${audiosDir}' creado.`);
+    }
+
+    if (!fs.existsSync(receivedDir)) {
+        fs.mkdirSync(receivedDir, { recursive: true });
+        console.log(`Directorio '${receivedDir}' creado.`);
+    }
+
+    if (!fs.existsSync(sentDir)) {
+        fs.mkdirSync(sentDir, { recursive: true });
+        console.log(`Directorio '${sentDir}' creado.`);
+    }
+}
+
+// Asegurar que los directorios para audios existan
+ensureAudiosDirectory();
+
+/**
+ * Función para convertir texto a voz utilizando Google Cloud Text-to-Speech.
+ * @param {string} text - Texto que se convertirá a audio.
+ * @returns {Promise<string>} - La ruta del archivo de audio generado.
+ */
+async function synthesizeSpeech(text: string): Promise<string> {
+    try {
+        const request = {
+            input: { text },
+            voice: { languageCode: 'es-ES', ssmlGender: ttsProtos.google.cloud.texttospeech.v1.SsmlVoiceGender.FEMALE },
+            audioConfig: { audioEncoding: ttsProtos.google.cloud.texttospeech.v1.AudioEncoding.MP3 },
+        };
+
+        const [response] = await ttsClient.synthesizeSpeech(request);
+        const audioContent = response.audioContent;
+
+        if (audioContent) {
+            const audioFilePath = `./audios/sent/response-${uuidv4()}.mp3`;
+            await fs.promises.writeFile(audioFilePath, audioContent, 'binary');
+            console.log(`Audio sintetizado guardado en: ${audioFilePath}`);
+            return audioFilePath;
+        } else {
+            throw new Error('No se pudo obtener contenido de audio.');
+        }
+    } catch (error) {
+        console.error(`Error en synthesizeSpeech: ${error}`);
+        throw error;
+    }
+}
+
+/** Mecanismos de colas y bloqueo para gestionar múltiples usuarios */
+const userQueues = new Map();
+const userLocks = new Map();
+
+const welcomeText = '¡Bienvenido! Estoy aquí para ayudarte. Por favor, no dudes en escribir tu inquietud.';
+const welcomeImageUrl = 'https://saludprimavera.com.pe/wp-content/uploads/2022/02/odontologia.jpg';
+
+/**
+ * Función para procesar el mensaje del usuario.
+ * @param {Object} ctx - El contexto del mensaje.
+ */
+const processUserMessage = async (ctx: any, { flowDynamic, state, provider }: { flowDynamic: any, state: any, provider: any }) => {
+    try {
+        await typing(ctx, provider); // Indicador de "escribiendo"
+
+        const userMessage = ctx.body;
+
+        if (userMessage) {
+            // Generar la respuesta en texto usando Groq
+            const responseText = await generateGroqResponse(userMessage);
+
+            // Enviar la respuesta en texto
+            await flowDynamic([{ text: responseText }]);
+
+            // Generar la respuesta en formato de audio
+            const sentAudioPath = await synthesizeSpeech(responseText);
+
+            // Enviar la respuesta en formato de audio
+            await flowDynamic([{ media: sentAudioPath }]);
+        }
+    } catch (error) {
+        await flowDynamic([{ text: 'Ocurrió un error procesando tu mensaje.' }]);
+    }
+};
+
+/**
+ * Función para manejar la cola de mensajes por usuario.
+ * @param {string} userId - El ID del usuario.
+ */
+const handleQueue = async (userId: string) => {
+    const queue = userQueues.get(userId);
+
+    if (userLocks.get(userId)) {
+        return;
+    }
+
+    while (queue && queue.length > 0) {
+        userLocks.set(userId, true);
+        const { ctx, flowDynamic, state, provider } = queue.shift();
+        try {
+            await processUserMessage(ctx, { flowDynamic, state, provider });
+        } finally {
+            userLocks.set(userId, false);
+        }
+    }
+
+    userLocks.delete(userId);
+    userQueues.delete(userId);
+};
+
+const generalFlow = addKeyword(['.*']).addAction(async (ctx: any, { flowDynamic, state, provider }: { flowDynamic: any, state: any, provider: any }) => {
+    const userId = ctx.from;
+
+    if (!userQueues.has(userId)) {
+        userQueues.set(userId, []);
+    }
+
+    const queue = userQueues.get(userId);
+    queue.push({ ctx, flowDynamic, state, provider });
+
+    if (!userLocks.get(userId) && queue.length === 1) {
+        await handleQueue(userId);
+    }
+});
+
+const main = async () => {
+    try {
+        const adapterFlow = createFlow([generalFlow]);
+        const adapterProvider = createProvider(BaileysProvider, { groupsIgnore: true, readStatus: false });
+        const adapterDB = new MemoryDB();
+        const { httpServer } = await createBot({
+            flow: adapterFlow,
+            provider: adapterProvider,
+            database: adapterDB,
+        });
+
+        httpServer(PORT);
+        console.log(`Servidor escuchando en http://localhost:${PORT}`);
+    } catch (error) {
+        process.exit(1);
+    }
+};
+
+// Ejecutar el bot
+main().catch((error) => {
+    process.exit(1);
+});
